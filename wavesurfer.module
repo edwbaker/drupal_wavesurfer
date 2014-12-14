@@ -1,6 +1,11 @@
 <?php
 
 /**
+ * @file
+ * Defines a field formatter and theming for the wavesurfer plugin.
+ */
+
+/**
  * Implements hook_libraries_info().
  *
  * Declare the wavesurfer library and files.
@@ -16,11 +21,11 @@ function wavesurfer_libraries_info() {
       'js' => array(
         'src/wavesurfer.js',
         'src/webaudio.js',
-        'src/webaudio.buffer.js',
-        'src/webaudio.media.js',
         'src/audioelement.js',
         'src/drawer.js',
-        'src/drawer.canvas.js'),
+        'src/drawer.canvas.js',
+        'plugin/wavesurfer.regions.js'
+      ),
     ),
   );
   return $libraries;
@@ -43,8 +48,8 @@ function wavesurfer_field_formatter_info() {
       'field types' => array('file'),
       'description' => t('Displays a waveform player generated from an audio file'),
       'settings' => array(
-        'wavecolor' => '#ffffff',
-        'progress_colour' => '#ffffff',
+        'wavecolor' => '000000',
+        'progress_colour' => '000000',
       ),
     ),
   );
@@ -138,67 +143,75 @@ function wavesurfer_theme() {
  */
 function theme_wavesurfer_waveform($variables) {
   $file = $variables['file'];
-
+  // Exit if no valid file.
   if (!$file) {
     return '';
   }
+  // Check mime type supported.
+  $allowed_mimetypes = array(
+    'audio/mpeg',
+    'audio/ogg',
+    'audio/x-wav',
+  );
+  if (!in_array($file->filemime, $allowed_mimetypes)) {
+    return '<div class="messages error"><p>Mime type not supported by Wavesurfer</p></div>';
+  }
   $settings = $variables['settings'];
   // Extract settings variables; $wavecolor, $progress_colour.
+  //^^ Why two spellings of colo(u)r?
   extract($settings);
 
+  // Set up JavaScript call.
+  $container_id = 'waveform_' . $file->fid;
+  $wavesurfer_id = 'wavesurfer_' . $file->fid;
   libraries_load('wavesurfer');
-
   $audiofile = file_create_url($file->uri);
-  $js  = "jQuery(document).ready(function () {
-            var wavesurfer = Object.create(WaveSurfer);
-            wavesurfer.init({
-                container: document.querySelector('#waveform'),
-                waveColor: '#$wavecolor',
-                progressColor: '#$progress_colour',
-                renderer: 'Canvas',
-                backend: 'WebAudioBuffer',
-                fillParent: true,
-            });
-            wavesurfer.on('ready', function () {
-              wavesurfer.play();
-            });
-            wavesurfer.load('$audiofile');
-            (function () {
-            var eventHandlers = {
-                'play': function () {
-                    wavesurfer.playPause();
-                },
-            };
-            document.addEventListener('keydown', function (e) {
-                var map = {
-                    32: 'play',       // space
-                };
-                if (e.keyCode in map) {
-                    var handler = eventHandlers[map[e.keyCode]];
-                    e.preventDefault();
-                    handler && handler(e);
-                }
-            });
-
-            document.addEventListener('click', function (e) {
-                var action = e.target.dataset && e.target.dataset.action;
-                if (action && action in eventHandlers) {
-                    eventHandlers[action](e);
-                }
-            });
-          }());
-        });";
-  drupal_add_js($js, 'inline');
+  $onready = array();
+  foreach (module_implements('wavesurfer_onready') as $module) {
+  	$onready[] = module_invoke($module, 'wavesurfer_onready');
+  }
+  
+  $duration = wavesurfer_duration_wav(drupal_realpath($file->uri));
+  $max_canvas_size = 32000;
+  $pixels_second = $max_canvas_size / $duration;
+  
+  
+  drupal_add_js(array('wavesurfer' => array('onready' => $onready)), 'setting');
+  
+  $data_array = array(
+            'container_id' => $container_id,
+            'wavesurfer_id' => $wavesurfer_id,
+            'fileid' => $file->fid,
+            'audiofile' => $audiofile,
+            'wavecolor' => $wavecolor,
+            'progresscolor' => $progress_colour,
+            'pixelrate' => $pixels_second
+          );
+  
+  
+  
+  drupal_add_js(drupal_get_path('module', 'wavesurfer').'/js/wavesurfer_module.js', 'file');
+  drupal_add_css(drupal_get_path('module', 'wavesurfer').'/css/wavesurfer.css', 'file');
 
   // Container html.
-  $output = '<div id="waveform"><div class="progress progress-striped active" id="progress-bar">
-                        <div class="progress-bar progress-bar-info"></div>
-                    </div></div>';
+  $output = '<span id="wavesurfer_position"></span>
+  		     <div id="' . $container_id . '" class="wavesurfer-container" ';
+  
+  foreach ($data_array as $key => $value) {
+  	$output .= " data-$key='$value'";
+  }
+  		     		
+  $output .= '>
+               <div id="progress-bar-'.$file->fid.'" class="progress progress-striped active" style="display: none;">
+			     <div class="progress-bar-'.$file->fid.' progress-bar progress-bar-info" style="width: 100%;">
+				 </div>
+               </div>
+  		     </div>';
 
   // Controls HTML
   // @TODO Could probably add more in here and make it optional in settings.
   $output .= '<div class="controls">
-                <button class="btn btn-primary" data-action="play">
+                <button id="play_' . $file->fid . '" class="btn btn-primary" onclick="wavesurfer_playsurfer('.$file->fid.')">
                     <i class="play"></i>
                     Play
                     /
@@ -206,6 +219,31 @@ function theme_wavesurfer_waveform($variables) {
                     Pause
                 </button>
               </div>';
+  
+  $output .= '<div class="wavesurfer-file-download">';
+  $output .= l('Download', $audiofile);
+  $output.= '</div>';
 
   return $output;
 }
+
+
+function wavesurfer_duration_wav($file) {
+	$fp = fopen($file, 'r');
+	if (fread($fp,4) == "RIFF") {
+		fseek($fp, 20);
+		$rawheader = fread($fp, 16);
+		$header = unpack('vtype/vchannels/Vsamplerate/Vbytespersec/valignment/vbits',$rawheader);
+		$pos = ftell($fp);
+		while (fread($fp,4) != "data" && !feof($fp)) {
+			$pos++;
+			fseek($fp,$pos);
+		}
+		$rawheader = fread($fp, 4);
+		$data = unpack('Vdatasize',$rawheader);
+		$sec = $data['datasize']/$header['bytespersec'];
+		return $sec;
+	}
+}
+
+

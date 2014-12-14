@@ -1,6 +1,11 @@
 <?php
 
 /**
+ * @file
+ * Install file for the wavesurfer module.
+ */
+
+/**
  * Implements hook_requirements().
  */
 function wavesurfer_requirements($phase) {
